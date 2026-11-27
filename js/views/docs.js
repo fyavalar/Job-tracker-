@@ -1,13 +1,16 @@
 import { state, customerById, jobById } from "../state.js";
 import { saveDocument, deleteDocument, convertEstimateToJob, createInvoiceFromEstimate } from "../actions.js";
-import { empty, err, field, section, selectField } from "../components.js";
+import { empty, err, field, section, selectField, segmented, avatar } from "../components.js";
+import { confirmSheet } from "../sheet.js";
+import { estimateLinesFromLayout, layoutStats, summaryLines, PALETTES } from "../layout.js";
+import { blueprintSvg, layoutJpegBytes } from "../blueprint.js";
 import { icon } from "../icons.js";
-import { esc, centsToInput, downloadBlob, formatQty, money, niceDate, parseDollarsToCents, parsePercent, parseQty, todayISO, uid } from "../format.js";
+import { esc, centsToInput, downloadBlob, formatQty, money, niceDate, parseDollarsToCents, parsePercent, parseQty, shareOrDownload, todayISO, uid } from "../format.js";
 import { docTotals, invoiceBalanceCents, lineTotalCents } from "../calc.js";
 import { docNumber, jobTitle } from "../model.js";
 import { buildPdf, pdfFileName } from "../pdf.js";
 import { dataUrlToJpegBytes } from "../images.js";
-import { go, render, toast } from "../nav.js";
+import { go, render, toast, markSaved, currentRoute } from "../nav.js";
 
 let working = null;
 let workingKey = "";
@@ -30,21 +33,29 @@ function statusLabel(doc, kind) {
   if (doc.status === "void") return "Void";
   if (doc.status === "draft") return "Draft";
   const total = docTotals(doc).total;
-  const paid = total - invoiceBalanceCents(doc, state.payments);
+  const paid = total - invoiceBalanceCents(doc, state.payments, state.invoices);
   if (total > 0 && paid >= total) return "Paid";
   if (paid > 0) return "Partial";
   return "Open";
 }
 
+function wrapCards(html, kind) {
+  return storeOf(kind).length ? `<div class="list">${html}</div>` : html;
+}
+
+const unitOf = (u) => (u === "each" || u === "lf" ? u : "sqft");
+const unitShort = (u) => (u === "each" ? " ea" : u === "lf" ? " lf" : " sq ft");
+
 function listCards(kind) {
   const rows = storeOf(kind).slice().sort((a, b) => String(b.issueDate).localeCompare(String(a.issueDate)) || b.number - a.number);
   if (!rows.length) {
-    return empty(kind === "invoice" ? "No invoices yet" : "No estimates yet", kind === "invoice" ? "Create one from an estimate or a job." : "An estimate can turn into a job, then an invoice.");
+    return empty(kind === "invoice" ? "No invoices yet" : "No estimates yet", kind === "invoice" ? "Create one from an estimate or a job." : "Draw the countertops on a job and the estimate fills itself in.", { art: "doc" });
   }
   return rows
     .map((doc) => {
       const customer = customerById(doc.customerId);
-      return `<a class="card card-link" href="#/${kind}s/${esc(doc.id)}"><div class="card-top"><strong>${esc(docNumber(kind, doc.number))}</strong><b>${esc(money(docTotals(doc).total))}</b></div><div class="meta">${esc(customer?.name || "No customer")} · ${esc(statusLabel(doc, kind))}${doc.issueDate ? " · " + esc(niceDate(doc.issueDate, { year: true })) : ""}</div></a>`;
+      const status = statusLabel(doc, kind);
+      return `<a class="row-main" href="#/${kind}s/${esc(doc.id)}">${avatar(customer?.name || "?", { size: "sm" })}<span class="row-text"><strong>${esc(customer?.name || "No customer")}</strong><small>${esc(docNumber(kind, doc.number))}${doc.issueDate ? " · " + esc(niceDate(doc.issueDate, { year: true })) : ""}</small></span><span class="doc-end"><b class="row-amt">${esc(money(docTotals(doc).total))}</b><span class="status-chip" data-status="${esc(status.toLowerCase())}">${esc(status)}</span></span></a>`;
     })
     .join("");
 }
@@ -52,13 +63,15 @@ function listCards(kind) {
 export const estimates = {
   title: () => "Estimates",
   back: () => "#/more",
-  html: () => listCards("estimate") + `<a class="btn primary block" href="#/estimates/new">${icon("plus")} New estimate</a>`
+  action: () => `<a class="icon-btn" href="#/estimates/new" aria-label="New estimate">${icon("plus")}</a>`,
+  html: () => wrapCards(listCards("estimate"), "estimate") + `<a class="btn primary block" href="#/estimates/new">${icon("plus")} New estimate</a>`
 };
 
 export const invoices = {
   title: () => "Invoices",
   back: () => "#/money",
-  html: () => listCards("invoice") + `<a class="btn primary block" href="#/invoices/new">${icon("plus")} New invoice</a>`
+  action: () => `<a class="icon-btn" href="#/invoices/new" aria-label="New invoice">${icon("plus")}</a>`,
+  html: () => wrapCards(listCards("invoice"), "invoice") + `<a class="btn primary block" href="#/invoices/new">${icon("plus")} New invoice</a>`
 };
 
 function blankLine() {
@@ -71,9 +84,18 @@ function lineFromRecord(line) {
     description: line.description || "",
     qty: formatQty(line.qty || 0) || (line.qty === 0 ? "0" : ""),
     price: centsToInput(line.unitPriceCents),
-    unit: line.unit === "each" ? "each" : "sqft",
+    unit: unitOf(line.unit),
     priceBookId: line.priceBookId || ""
   };
+}
+
+function linesForJob(job) {
+  if (!job) return [blankLine()];
+  if (job.layout?.pieces?.length) {
+    const lines = estimateLinesFromLayout(job.layout, { priceBook: state.priceBook, material: job.material, color: job.stoneColor });
+    if (lines.length) return lines.map(lineFromRecord);
+  }
+  return [{ id: uid(), description: [job.material, job.stoneColor].filter(Boolean).join(" ") || "Countertop", qty: formatQty(job.sqft || 0), price: "", unit: "sqft", priceBookId: "" }];
 }
 
 function initialDoc(route) {
@@ -88,7 +110,7 @@ function initialDoc(route) {
     status: kind === "invoice" ? "open" : "draft",
     issueDate: todayISO(),
     dueDate: "",
-    lines: job ? [{ id: uid(), description: [job.material, job.stoneColor].filter(Boolean).join(" ") || "Countertop", qty: formatQty(job.sqft || 0), price: "", unit: "sqft", priceBookId: "" }] : [blankLine()],
+    lines: linesForJob(job),
     discountType: "amount",
     discountValue: "",
     tax: String(state.business.taxRate ?? ""),
@@ -123,7 +145,7 @@ function readRaw(form) {
     description: row.querySelector("[data-k=description]").value,
     qty: row.querySelector("[data-k=qty]").value,
     price: row.querySelector("[data-k=price]").value,
-    unit: row.querySelector("[data-k=unit]").value === "each" ? "each" : "sqft",
+    unit: unitOf(row.querySelector("[data-k=unit]").value),
     priceBookId: row.querySelector("[data-k=priceBookId]").value
   }));
   const data = Object.fromEntries(new FormData(form).entries());
@@ -204,18 +226,19 @@ function totalsHtml(doc) {
     { label: "Deposit due", value: money(totals.deposit) }
   ];
   const zero = (doc.lines || []).some((line) => line.qty > 0 && !line.unitPriceCents && line.description);
-  return `<div class="sums">${rows.map((row) => `<div class="${row.strong ? "grand" : ""}"><span>${esc(row.label)}</span><b>${esc(row.value)}</b></div>`).join("")}</div>${zero ? `<p class="meta">A line is priced at $0. That's fine for something included, otherwise set a price.</p>` : ""}`;
+  return `<div class="sums">${rows.map((row) => `<div class="${row.strong ? "grand" : ""}"><span>${esc(row.label)}</span><b>${esc(row.value)}</b></div>`).join("")}</div>${zero ? `<p class="hint warn-text">A line is priced at $0. That's fine for something included — otherwise set a price.</p>` : ""}`;
 }
 
 function lineHtml(line) {
+  const u = unitOf(line.unit);
   return `<div class="line" data-line="${esc(line.id)}">
-    <label class="field"><span class="lbl">Description</span><input data-k="description" value="${esc(line.description)}"></label>
+    <label class="field"><span class="lbl">Description</span><input data-k="description" value="${esc(line.description)}" autocapitalize="sentences" placeholder="Quartz countertop"></label>
     <div class="line-grid">
       <label class="field"><span class="lbl">Qty</span><input data-k="qty" inputmode="decimal" value="${esc(line.qty)}"></label>
-      <label class="field"><span class="lbl">Unit</span><span class="select"><select data-k="unit"><option value="sqft"${line.unit !== "each" ? " selected" : ""}>sq ft</option><option value="each"${line.unit === "each" ? " selected" : ""}>each</option></select></span></label>
-      <label class="field"><span class="lbl">Price</span><input data-k="price" inputmode="decimal" value="${esc(line.price)}"></label>
+      <label class="field"><span class="lbl">Unit</span><span class="select"><select data-k="unit"><option value="sqft"${u === "sqft" ? " selected" : ""}>sq ft</option><option value="lf"${u === "lf" ? " selected" : ""}>lin ft</option><option value="each"${u === "each" ? " selected" : ""}>each</option></select></span></label>
+      <label class="field"><span class="lbl">Price</span><span class="adorned has-prefix"><span class="adorn pre" aria-hidden="true">$</span><input data-k="price" inputmode="decimal" value="${esc(line.price)}" enterkeyhint="next" placeholder="0.00"></span></label>
     </div>
-    <div class="line-foot"><span data-amt>${esc(amountLabel(line))}</span><button type="button" class="text-btn" data-act="remove-line" data-id="${esc(line.id)}">Remove</button></div>
+    <div class="line-foot"><b data-amt>${esc(amountLabel(line))}</b><button type="button" class="text-btn danger-text" data-act="remove-line" data-id="${esc(line.id)}">${icon("trash")} Remove</button></div>
     <input type="hidden" data-k="priceBookId" value="${esc(line.priceBookId)}">
   </div>`;
 }
@@ -232,7 +255,7 @@ function pickerHtml(jobId) {
   const items = state.priceBook.filter((item) => item.active !== false).slice().sort((a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name));
   if (!items.length) return `<p class="meta">Your price book is empty.</p>`;
   return `<div class="picker">${items
-    .map((item) => `<button type="button" class="picker-row" data-act="use-price" data-id="${esc(item.id)}" data-job="${esc(job?.id || "")}"><span><b>${esc(item.name)}</b><small>${esc(item.category)} · ${esc(item.unit === "sqft" ? "sq ft" : "each")}${item.starter ? " · Starter price" : ""}</small></span><b>${esc(money(item.unitPriceCents))}</b></button>`)
+    .map((item) => `<button type="button" class="picker-row" data-act="use-price" data-id="${esc(item.id)}" data-job="${esc(job?.id || "")}"><span class="row-text"><strong>${esc(item.name)}</strong><small>${esc(item.category)} · per${esc(unitShort(item.unit))}${item.starter ? " · Starter price" : ""}</small></span><b>${esc(money(item.unitPriceCents))}</b>${icon("plus")}</button>`)
     .join("")}</div>`;
 }
 
@@ -258,28 +281,30 @@ export const editor = {
     const statuses = working.kind === "invoice"
       ? [["draft", "Draft"], ["open", "Open"], ["void", "Void"]]
       : [["draft", "Draft"], ["sent", "Sent"], ["accepted", "Accepted"], ["declined", "Declined"]];
-    return `<form id="doc-form">
-      ${section("Customer and job", [
+    const linkedJob = jobById(working.jobId);
+    const layoutNote = linkedJob?.layout?.pieces?.length
+      ? `<div class="layout-note">${blueprintSvg(linkedJob.layout, { width: 120, maxHeight: 70, cabinets: false, dims: false, labels: false, className: "bp bp-thumb" }).svg}<div><strong>Layout on file</strong><small>${esc(summaryLines(layoutStats(linkedJob.layout)).slice(0, 2).join(" · "))}</small><button type="button" class="text-btn" data-act="from-layout">Fill lines from layout</button></div></div>`
+      : "";
+    const existingInvoice = working.kind === "estimate" && working.id ? state.invoices.find((inv) => inv.sourceEstimateId === working.id && inv.status !== "void") : null;
+    return `<form id="doc-form" data-guard novalidate>
+      ${section("Customer & job", `<div class="form-stack">${[
         selectField({ label: "Customer", name: "customerId", value: working.customerId, options: [{ value: "", label: "Select a customer" }, ...customers.map((c) => ({ value: c.id, label: c.name }))] }),
-        selectField({ label: "Job", name: "jobId", value: working.jobId, options: [{ value: "", label: "No job yet" }, ...jobs.map((job) => ({ value: job.id, label: jobTitle(job) }))] }),
+        selectField({ label: "Job", name: "jobId", value: working.jobId, options: [{ value: "", label: "No job yet" }, ...jobs.map((job) => ({ value: job.id, label: (working.customerId ? "" : (customerById(job.customerId)?.name || "") + " · ") + jobTitle(job) }))] }),
+        layoutNote,
         selectField({ label: "Status", name: "status", value: working.status, options: statuses.map(([value, label]) => ({ value, label })) }),
-        field({ label: "Date", name: "issueDate", value: working.issueDate, type: "date" }),
-        field({ label: "Due date", name: "dueDate", value: working.dueDate, type: "date" })
-      ].join(""))}
-      ${section("Line items", (picking ? pickerHtml(working.jobId) : "") + working.lines.map(lineHtml).join("") + `<div class="btn-row"><button type="button" class="btn" data-act="pick">${picking ? "Close price book" : "Add from price book"}</button><button type="button" class="btn" data-act="add-line">Custom line</button></div>`)}
-      ${section("Tax and totals", [
-        selectField({ label: "Discount", name: "discountType", value: working.discountType, options: [{ value: "amount", label: "Dollar amount" }, { value: "percent", label: "Percent" }] }),
-        field({ label: working.discountType === "percent" ? "Discount percent" : "Discount amount", name: "discountValue", value: working.discountValue, inputmode: "decimal" }),
-        field({ label: "Tax percent", name: "tax", value: working.tax, inputmode: "decimal" }),
-        field({ label: "Deposit percent", name: "deposit", value: working.deposit, inputmode: "decimal" }),
+        `<div class="two-col">${field({ label: "Date", name: "issueDate", value: working.issueDate, type: "date" })}${field({ label: "Due date", name: "dueDate", value: working.dueDate, type: "date" })}</div>`
+      ].join("")}</div>`, { className: "form-group" })}
+      ${section("Line items", working.lines.map(lineHtml).join("") + `<div class="btn-row"><button type="button" class="btn${picking ? " is-on" : ""}" data-act="pick" aria-expanded="${picking}">${icon("tag")} ${picking ? "Close price book" : "Price book"}</button><button type="button" class="btn" data-act="add-line">${icon("plus")} Custom line</button></div>` + (picking ? pickerHtml(working.jobId) : ""), { className: "form-group lines-group" })}
+      ${section("Tax & totals", `<div class="form-stack">${[
+        `<div class="discount-row">${segmented([["amount", "$ off"], ["percent", "% off"]], working.discountType, "disc-type", { label: "Discount type", className: "seg-sm" })}<input type="hidden" name="discountType" id="discountType" value="${esc(working.discountType)}">${field({ label: "Discount", name: "discountValue", value: working.discountValue, inputmode: "decimal", placeholder: "0", ...(working.discountType === "percent" ? { suffix: "%" } : { currency: true }) })}</div>`,
+        `<div class="two-col">${field({ label: "Tax", name: "tax", value: working.tax, inputmode: "decimal", suffix: "%" })}${field({ label: "Deposit", name: "deposit", value: working.deposit, inputmode: "decimal", suffix: "%" })}</div>`,
         `<div id="doc-totals">${totalsFromRaw(working)}</div>`
-      ].join(""))}
-      ${section("Notes", field({ label: "Note for the customer", name: "notes", value: working.notes, multiline: true }))}
+      ].join("")}</div>`, { className: "form-group" })}
+      ${section("Notes", field({ label: "Note for the customer", name: "notes", value: working.notes, multiline: true, rows: 3, autocapitalize: "sentences" }), { className: "form-group" })}
       ${err(working.error)}
-      <button class="btn primary block" type="submit">Save</button>
-      <button class="btn block" type="button" data-act="preview">Save and preview</button>
-      ${working.kind === "estimate" ? `<button class="btn block" type="button" data-act="to-job">Turn into a job</button><button class="btn block" type="button" data-act="to-invoice">Create invoice</button>` : ""}
-      ${working.id ? `<button class="btn danger block" type="button" data-act="delete">${working.confirmDelete ? "Delete this " + (working.kind === "invoice" ? "invoice" : "estimate") : "Delete"}</button>` : ""}
+      <div class="form-bar two"><button class="btn" type="submit">Save</button><button class="btn primary" type="button" data-act="preview">${icon("doc")} Save & preview</button></div>
+      ${working.kind === "estimate" ? `<div class="btn-row"><button class="btn" type="button" data-act="to-job">${icon("jobs")} Make it a job</button><button class="btn" type="button" data-act="to-invoice">${icon("doc")} ${existingInvoice ? "View invoice" : "Create invoice"}</button></div>` : ""}
+      ${working.id ? `<button class="btn danger-ghost block" type="button" data-act="delete">${icon("trash")} Delete ${working.kind === "invoice" ? "invoice" : "estimate"}</button>` : ""}
     </form>`;
   },
   onInput(event) {
@@ -288,7 +313,7 @@ export const editor = {
   onChange(event) {
     if (event.target.closest("[data-line]")) return paint();
     if (!event.target.form || event.target.form.id !== "doc-form") return;
-    if (["customerId", "jobId", "discountType", "status"].includes(event.target.id)) {
+    if (["customerId", "jobId", "status"].includes(event.target.id)) {
       working = readRaw(event.target.form);
       if (event.target.id === "customerId" && working.jobId) {
         const job = jobById(working.jobId);
@@ -300,9 +325,32 @@ export const editor = {
   async onSubmit(event) {
     await persist(event.target, "stay");
   },
+  leave() {
+    workingKey = "";
+    working = null;
+    picking = false;
+  },
   async onClick(act, el) {
     const form = document.getElementById("doc-form");
     if (!form) return;
+    if (act === "disc-type") {
+      working = readRaw(form);
+      working.discountType = el.dataset.val === "percent" ? "percent" : "amount";
+      return render({ keepScroll: true });
+    }
+    if (act === "from-layout") {
+      working = readRaw(form);
+      const job = jobById(working.jobId);
+      if (!job?.layout) return;
+      const hasContent = working.lines.some((l) => l.description.trim() || l.price.trim());
+      if (hasContent) {
+        const ok = await confirmSheet({ title: "Replace the line items?", message: "Lines are rebuilt from the layout: square feet, polished edge, backsplash and cutouts, priced from your price book.", confirm: "Replace lines", danger: false });
+        if (!ok) return;
+      }
+      working.lines = linesForJob(job);
+      toast("Lines filled from the layout");
+      return render({ keepScroll: true });
+    }
     if (act === "add-line") {
       working = readRaw(form);
       working.lines.push(blankLine());
@@ -324,27 +372,28 @@ export const editor = {
       if (!item) return;
       working = readRaw(form);
       const job = jobById(working.jobId);
-      const qty = item.unit === "sqft" && job?.sqft ? formatQty(job.sqft) : "1";
+      const stats = job?.layout?.pieces?.length ? layoutStats(job.layout) : null;
+      const qty = item.unit === "sqft" && job?.sqft ? formatQty(job.sqft) : item.unit === "lf" && stats?.polishedLF ? formatQty(Math.round(stats.polishedLF * 100) / 100) : "1";
       working.lines.push({ id: uid(), description: item.name, qty, price: centsToInput(item.unitPriceCents) || "0", unit: item.unit, priceBookId: item.id });
       picking = false;
+      toast("Added " + item.name);
       return render({ keepScroll: true });
     }
     if (act === "preview") return persist(form, "preview");
     if (act === "to-job" || act === "to-invoice") return persist(form, act);
     if (act === "delete" && working?.id) {
-      if (!working.confirmDelete) {
-        working = readRaw(form);
-        working.confirmDelete = true;
-        return render({ keepScroll: true });
-      }
+      const word = working.kind === "invoice" ? "invoice" : "estimate";
+      const ok = await confirmSheet({ title: "Delete this " + word + "?", message: working.kind === "invoice" ? "Payments stay on the job. The invoice number isn't reused." : "The job it created (if any) stays.", confirm: "Delete " + word });
+      if (!ok) return;
       const result = await deleteDocument(working.kind, working.id);
       if (!result.ok) {
         working.error = result.error;
         return render({ keepScroll: true });
       }
+      const kind = working.kind;
       workingKey = "";
       toast("Deleted");
-      go("/" + (working.kind === "invoice" ? "invoices" : "estimates"));
+      go("/" + (kind === "invoice" ? "invoices" : "estimates"), { replace: true, force: true });
     }
   }
 };
@@ -374,22 +423,27 @@ async function persist(form, next) {
     working = { ...raw, error: result.error };
     return render({ keepScroll: true });
   }
+  const base = "/" + (raw.kind === "invoice" ? "invoices" : "estimates") + "/" + result.id;
+  const wasNew = !raw.id;
   workingKey = "";
+  // a brand-new doc's "new" screen is replaced by its saved screen, so Back doesn't reopen a blank form
+  if (wasNew) await go(base, { replace: true, force: true });
+  else markSaved();
   if (next === "to-job") {
     const converted = await convertEstimateToJob(result.id);
     if (!converted.ok) return toast(converted.error);
     toast(converted.existing ? "This estimate is already linked to a job." : "Job created from this estimate.");
-    return go("/jobs/" + converted.id);
+    return go("/jobs/" + converted.id, { force: true });
   }
   if (next === "to-invoice") {
     const converted = await createInvoiceFromEstimate(result.id);
     if (!converted.ok) return toast(converted.error);
-    toast("Invoice created. Review it before you share.");
-    return go("/invoices/" + converted.id);
+    toast(converted.existing ? "This estimate already has an invoice." : "Invoice created. Review it before you share.");
+    return go("/invoices/" + converted.id, { force: true });
   }
   toast("Saved");
-  if (next === "preview") return go("/" + (raw.kind === "invoice" ? "invoices" : "estimates") + "/" + result.id + "/preview");
-  return go("/" + (raw.kind === "invoice" ? "invoices" : "estimates") + "/" + result.id);
+  if (next === "preview") return go(base + "/preview", { force: true });
+  if (!wasNew) return render({ keepScroll: true });
 }
 
 export function paperModel(doc, kind) {
@@ -417,13 +471,15 @@ export function paperModel(doc, kind) {
     jobLine: [job ? jobTitle(job) : "", site].filter(Boolean).join("\n"),
     lines: (doc.lines || []).map((line) => ({
       description: line.description || "Item",
-      qty: (formatQty(line.qty) || "0") + (line.unit === "sqft" ? " sq ft" : " ea"),
+      qty: (formatQty(line.qty) || "0") + unitShort(line.unit),
       price: money(line.unitPriceCents || 0),
       amount: money(lineTotalCents(line))
     })),
     totals: rows,
     notes: [doc.notes, business.documentFooter].filter(Boolean).join("\n\n"),
-    logoDataUrl: business.logoDataUrl || ""
+    logoDataUrl: business.logoDataUrl || "",
+    layout: job?.layout?.pieces?.length ? job.layout : null,
+    layoutSummary: job?.layout?.pieces?.length ? summaryLines(layoutStats(job.layout)) : []
   };
 }
 
@@ -441,6 +497,7 @@ export function paperHtml(model) {
     <table><thead><tr><th>Description</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Amount</th></tr></thead>
     <tbody>${model.lines.map((line) => `<tr><td>${esc(line.description)}</td><td class="num">${esc(line.qty)}</td><td class="num">${esc(line.price)}</td><td class="num">${esc(line.amount)}</td></tr>`).join("")}</tbody></table>
     <div class="paper-totals">${model.totals.map((row) => `<div class="${row.strong ? "grand" : ""}"><span>${esc(row.label)}</span><b>${esc(row.value)}</b></div>`).join("")}</div>
+    ${model.layout ? `<div class="kicker">Countertop layout</div><div class="paper-layout">${blueprintSvg(model.layout, { width: 560, maxHeight: 300, palette: PALETTES.light, className: "bp bp-paper" }).svg}<ul>${model.layoutSummary.map((l) => `<li>${esc(l)}</li>`).join("")}</ul></div>` : ""}
     ${model.notes ? `<div class="kicker">Notes</div><p>${esc(model.notes).split("\n").join("<br>")}</p>` : ""}
   </article>`;
 }
@@ -460,19 +517,18 @@ export const preview = {
     const model = paperModel(doc, kind);
     const starter = (doc.lines || []).some((line) => state.priceBook.some((item) => item.id === line.priceBookId && item.starter));
     const missingName = !state.business.name;
-    return `<div class="no-print btn-col">
-      ${missingName ? `<p class="banner">Add your business name in Settings so this ${kind} shows it.</p>` : ""}
-      ${starter ? `<p class="banner">This uses a starter price. Change it in the price book before you send it.</p>` : ""}
-      <button type="button" class="btn primary" data-act="share">${icon("share")} Share PDF</button>
-      <button type="button" class="btn" data-act="print">${icon("print")} Print</button>
-      <p class="meta">Share opens your phone's share sheet. Nothing is sent until you choose Messages, Mail, or another app.</p>
-      <a class="btn" href="#/${kind === "invoice" ? "invoices" : "estimates"}/${esc(doc.id)}">Edit</a>
-      ${kind === "estimate" ? `<button type="button" class="btn" data-act="to-job">Turn into a job</button><button type="button" class="btn" data-act="to-invoice">Create invoice</button>` : doc.jobId ? `<a class="btn" href="#/jobs/${esc(doc.jobId)}/pay/new">Record a payment</a>` : ""}
+    return `<div class="no-print preview-actions">
+      ${missingName ? `<p class="banner warn">Add your business name in Settings so this ${kind} shows it. <a class="text-link" href="#/settings">Settings</a></p>` : ""}
+      ${starter ? `<p class="banner warn">This uses a starter price. Change it in the price book before you send it.</p>` : ""}
+      <div class="btn-row"><button type="button" class="btn primary" data-act="share">${icon("share")} Share PDF</button><button type="button" class="btn" data-act="print">${icon("print")} Print</button></div>
+      <p class="hint center">Share opens your phone's share sheet. Nothing is sent until you pick Messages, Mail, or another app.</p>
+      <div class="btn-row">${kind === "estimate" ? `<button type="button" class="btn sm" data-act="to-job">Make it a job</button><button type="button" class="btn sm" data-act="to-invoice">Invoice</button>` : doc.jobId ? `<a class="btn sm" href="#/jobs/${esc(doc.jobId)}/pay/new">Log payment</a>` : ""}</div>
     </div>
     ${paperHtml(model)}`;
   },
+  action: (route) => `<a class="text-btn" href="#/${esc(route.parts[0])}/${esc(route.parts[1])}">Edit</a>`,
   async onClick(act, el, event) {
-    const route = { parts: location.hash.replace(/^#/, "").split("?")[0].split("/").filter(Boolean) };
+    const route = currentRoute();
     const kind = kindOf(route);
     const doc = findDoc(kind, route.parts[1]);
     if (!doc) return;
@@ -482,13 +538,13 @@ export const preview = {
       const result = await convertEstimateToJob(doc.id);
       if (!result.ok) return toast(result.error);
       toast(result.existing ? "Already linked to a job." : "Job created.");
-      return go("/jobs/" + result.id);
+      return go("/jobs/" + result.id, { force: true });
     }
     if (act === "to-invoice") {
       const result = await createInvoiceFromEstimate(doc.id);
       if (!result.ok) return toast(result.error);
-      toast("Invoice created.");
-      return go("/invoices/" + result.id);
+      toast(result.existing ? "This estimate already has an invoice." : "Invoice created. Review it before you share.");
+      return go("/invoices/" + result.id, { force: true });
     }
   }
 };
@@ -500,17 +556,16 @@ async function shareDoc(doc, kind) {
   } catch {
     model.logoJpeg = null;
   }
-  const bytes = buildPdf(model);
-  const name = pdfFileName(model.kind, model.number);
-  const file = new File([bytes], name, { type: "application/pdf" });
-  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+  if (model.layout) {
     try {
-      await navigator.share({ files: [file], title: name });
-      return;
-    } catch (error) {
-      if (error?.name === "AbortError") return;
+      model.layoutJpeg = await layoutJpegBytes(model.layout, { width: 1400, maxHeight: 640 });
+    } catch {
+      model.layoutJpeg = null;
     }
   }
-  downloadBlob(new Blob([bytes], { type: "application/pdf" }), name);
-  toast("PDF downloaded. On your phone, Share sends it through the share sheet.");
+  const bytes = buildPdf(model);
+  const name = pdfFileName(model.kind, model.number);
+  // one path only: shareOrDownload shares, and falls back to a download if sharing fails (no second share sheet)
+  const how = await shareOrDownload(new Blob([bytes], { type: "application/pdf" }), name, name);
+  if (how === "downloaded") toast("PDF downloaded. On your phone, Share sends it through the share sheet.");
 }

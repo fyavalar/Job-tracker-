@@ -8,7 +8,7 @@
 <meta name="apple-mobile-web-app-title" content="JOBS">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="application-name" content="JOBS">
-<meta name="theme-color" content="#171c18">
+<meta name="theme-color" content="#f2f1ed">
 <meta name="format-detection" content="telephone=no">
 <title>JOBS</title>
 <link rel="icon" href="icon-192.png">
@@ -21,6 +21,12 @@
     var t = localStorage.getItem("jobs-theme") || "system";
     if (t !== "light" && t !== "dark" && t !== "system") t = "system";
     document.documentElement.setAttribute("data-theme", t);
+    var dark = t === "dark" || (t === "system" && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+    var color = dark ? "#0e0e0d" : "#f2f1ed";
+    var meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute("content", color);
+    var bar = document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');
+    if (bar) bar.setAttribute("content", dark ? "black-translucent" : "default");
   } catch (e) {
     document.documentElement.setAttribute("data-theme", "system");
   }

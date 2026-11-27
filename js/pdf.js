@@ -28,11 +28,27 @@ const EXTRA = {
   "\u0178": 159
 };
 
+const FOLD = {
+  "ş": "s",
+  "Ş": "S",
+  "ğ": "g",
+  "Ğ": "G",
+  "ı": "i",
+  "İ": "I",
+  "ă": "a",
+  "Ă": "A"
+};
+
+function foldChar(ch) {
+  return FOLD[ch] || ch;
+}
+
 function winByte(ch) {
-  const code = ch.codePointAt(0);
+  const mapped = foldChar(ch);
+  const code = mapped.codePointAt(0);
   if (code >= 32 && code <= 126) return code;
   if (code >= 160 && code <= 255) return code;
-  return EXTRA[ch] || 63;
+  return EXTRA[mapped] || EXTRA[ch] || 63;
 }
 
 function pdfText(value) {
@@ -107,10 +123,52 @@ function block(text, size, width) {
   return lines.length ? lines : [""];
 }
 
+function charWidthFactor(ch) {
+  if (/[0-9$]/.test(ch)) return 0.556;
+  if (/[., ]/.test(ch)) return 0.278;
+  if (ch === "-") return 0.333;
+  if (/[A-Z]/.test(ch)) return 0.667;
+  if (ch === "%") return 0.889;
+  return 0.5;
+}
+
+export function textWidth(text, size) {
+  let units = 0;
+  for (const ch of String(text ?? "")) units += charWidthFactor(foldChar(ch));
+  return units * size;
+}
+
+// Wrap by measured width; the last allowed line is cut with an ellipsis.
+export function fitLines(text, size, width, maxLines = 99) {
+  const words = String(text ?? "").split(/\s+/).filter(Boolean);
+  const lines = [];
+  let line = "";
+  for (const word of words) {
+    const next = line ? line + " " + word : word;
+    if (textWidth(next, size) > width && line) {
+      lines.push(line);
+      line = word;
+    } else line = next;
+  }
+  if (line) lines.push(line);
+  if (lines.length > maxLines) {
+    const kept = lines.slice(0, maxLines);
+    let last = kept[maxLines - 1] + " " + lines.slice(maxLines).join(" ");
+    while (last.length > 1 && textWidth(last + "...", size) > width) last = last.slice(0, -1);
+    kept[maxLines - 1] = last.trimEnd() + "...";
+    return kept;
+  }
+  return lines.map((l) => {
+    let out = l;
+    while (out.length > 1 && textWidth(out, size) > width) out = out.slice(0, -1);
+    return out === l ? l : out + "...";
+  });
+}
+
 function drawLine(cmds, text, x, y, size, { bold = false, align = "left", width = 0 } = {}) {
   const font = bold ? "F2" : "F1";
   let dx = x;
-  if (align === "right" && width) dx = x + width - text.length * size * 0.52;
+  if (align === "right" && width) dx = x + width - textWidth(text, size);
   cmds.push(`BT /${font} ${size} Tf ${dx.toFixed(2)} ${y.toFixed(2)} Td ${pdfText(text)} Tj ET`);
 }
 
@@ -145,8 +203,18 @@ export function buildPdf(model) {
     }
   }
 
-  drawLine(cmds, model.businessName || "Estimate", model.logoJpeg ? 200 : left, y, 18, { bold: true });
+  // business name must never run into the document title at x=400
+  const nameX = model.logoJpeg ? 200 : left;
+  const nameMax = 400 - nameX - 14;
+  let nameSize = 18;
+  const nameText = model.businessName || "Estimate";
+  while (nameSize > 12 && textWidth(nameText, nameSize) > nameMax) nameSize -= 1;
+  const nameLines = textWidth(nameText, nameSize) > nameMax ? fitLines(nameText, nameSize, nameMax, 2) : [nameText];
   drawLine(cmds, model.kind || "Estimate", 400, y, 14, { bold: true });
+  nameLines.forEach((text, i) => {
+    drawLine(cmds, text, nameX, y, nameSize, { bold: true });
+    if (i < nameLines.length - 1) y -= nameSize + 2;
+  });
   y -= 18;
   for (const line of block(model.businessMeta || "", 10, 240)) {
     if (line) drawLine(cmds, line, model.logoJpeg ? 200 : left, y, 10);
@@ -179,9 +247,9 @@ export function buildPdf(model) {
   need(36);
   cmds.push(`0.93 0.91 0.86 rg ${left} ${y - 6} ${right - left} 22 re f`);
   drawLine(cmds, "Description", left + 6, y, 10, { bold: true });
-  drawLine(cmds, "Qty", 330, y, 10, { bold: true });
-  drawLine(cmds, "Price", 400, y, 10, { bold: true });
-  drawLine(cmds, "Amount", 490, y, 10, { bold: true });
+  drawLine(cmds, "Qty", 320, y, 10, { bold: true, align: "right", width: 54 });
+  drawLine(cmds, "Price", 384, y, 10, { bold: true, align: "right", width: 70 });
+  drawLine(cmds, "Amount", 464, y, 10, { bold: true, align: "right", width: 100 });
   y -= 22;
 
   for (const line of model.lines || []) {
@@ -191,9 +259,9 @@ export function buildPdf(model) {
     descLines.forEach((text, index) => {
       drawLine(cmds, text, left, y, 11);
       if (index === 0) {
-        drawLine(cmds, line.qty || "", 330, y, 11);
-        drawLine(cmds, line.price || "", 390, y, 11);
-        drawLine(cmds, line.amount || "", 470, y, 11);
+        drawLine(cmds, line.qty || "", 320, y, 11, { align: "right", width: 54 });
+        drawLine(cmds, line.price || "", 384, y, 11, { align: "right", width: 70 });
+        drawLine(cmds, line.amount || "", 464, y, 11, { align: "right", width: 100 });
       }
       y -= 14;
     });
@@ -205,8 +273,40 @@ export function buildPdf(model) {
   need(totals.length * 18 + 10);
   for (const row of totals) {
     drawLine(cmds, row.label, 330, y, row.strong ? 12 : 11, { bold: !!row.strong });
-    drawLine(cmds, row.value, 470, y, row.strong ? 12 : 11, { bold: !!row.strong });
+    drawLine(cmds, row.value, 464, y, row.strong ? 12 : 11, { bold: !!row.strong, align: "right", width: 100 });
     y -= row.strong ? 20 : 16;
+  }
+
+  const layoutImg = model.layoutJpeg?.bytes && jpegSize(model.layoutJpeg.bytes) ? model.layoutJpeg : null;
+  if (layoutImg || (model.layoutSummary || []).length) {
+    y -= 14;
+    const size = layoutImg ? jpegSize(layoutImg.bytes) : null;
+    const maxW = right - left;
+    let w = 0;
+    let h = 0;
+    if (size) {
+      w = maxW;
+      h = (size.height / size.width) * w;
+      if (h > 250) {
+        h = 250;
+        w = (size.width / size.height) * h;
+      }
+    }
+    const summary = model.layoutSummary || [];
+    need(20 + h + 10 + Math.min(summary.length, 3) * 14);
+    drawLine(cmds, "Countertop layout", left, y, 10, { bold: true });
+    y -= 10;
+    if (size) {
+      const x = left + (maxW - w) / 2;
+      cmds.push(`0.85 0.83 0.78 RG 0.6 w ${left} ${(y - h - 6).toFixed(2)} ${maxW} ${(h + 12).toFixed(2)} re S`);
+      cmds.push(`q ${w.toFixed(2)} 0 0 ${h.toFixed(2)} ${x.toFixed(2)} ${(y - h).toFixed(2)} cm /Im2 Do Q`);
+      y -= h + 22;
+    }
+    for (const line of summary) {
+      need(16);
+      drawLine(cmds, "\u2022 " + line.replace(/\u2033/g, '"'), left, y, 10.5);
+      y -= 14;
+    }
   }
 
   if (model.notes) {
@@ -239,6 +339,13 @@ export function buildPdf(model) {
     imageId = add({ header, bytes: model.logoJpeg, footer });
   }
 
+  let layoutId = null;
+  const layoutBytes = model.layoutJpeg?.bytes;
+  if (layoutBytes && jpegSize(layoutBytes)) {
+    const size = jpegSize(layoutBytes);
+    layoutId = add({ header: `<< /Type /XObject /Subtype /Image /Width ${size.width} /Height ${size.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${layoutBytes.length} >>\nstream\n`, bytes: layoutBytes, footer: "\nendstream" });
+  }
+
   const pageIds = [];
   const contentIds = [];
   for (const commands of pages) {
@@ -248,9 +355,8 @@ export function buildPdf(model) {
   }
   const pagesIdRef = objects.length + pages.length + 1;
   for (let i = 0; i < pages.length; i++) {
-    const resources = imageId
-      ? `/Font << /F1 ${font1} 0 R /F2 ${font2} 0 R >> /XObject << /Im1 ${imageId} 0 R >>`
-      : `/Font << /F1 ${font1} 0 R /F2 ${font2} 0 R >>`;
+    const xobjects = [imageId ? `/Im1 ${imageId} 0 R` : "", layoutId ? `/Im2 ${layoutId} 0 R` : ""].filter(Boolean).join(" ");
+    const resources = `/Font << /F1 ${font1} 0 R /F2 ${font2} 0 R >>` + (xobjects ? ` /XObject << ${xobjects} >>` : "");
     pageIds.push(
       add(
         `<< /Type /Page /Parent ${pagesIdRef} 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Resources << ${resources} >> /Contents ${contentIds[i]} 0 R >>`
@@ -267,9 +373,11 @@ export function buildPdf(model) {
   const chunks = [latin1("%PDF-1.4\n")];
   const offsets = [0];
   let position = chunks[0].length;
-  for (const obj of objects) {
+  // number by position: indexOf() returned the first match, so two identical objects broke the xref table
+  for (let index = 0; index < objects.length; index++) {
+    const obj = objects[index];
     offsets.push(position);
-    const head = latin1(objects.indexOf(obj) + 1 + " 0 obj\n");
+    const head = latin1(index + 1 + " 0 obj\n");
     let bodyChunks;
     let tail;
     if (typeof obj === "string") {

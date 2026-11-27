@@ -2,10 +2,13 @@ import * as db from "./db.js";
 import { state } from "./state.js";
 import { uid, todayISO, parseDollarsToCents, numberToCents } from "./format.js";
 import { STAGE_IDS, jobTitle, docNumber } from "./model.js";
-import { docTotals, balanceCents, jobRevenueCents, paidCents, profitCents, costCents } from "./calc.js";
+import { docTotals, balanceCents, jobRevenueCents, paidCents, profitCents, costCents, taxRateForContractInvoice, latestActiveInvoice, oldestUnpaidInvoiceId } from "./calc.js";
 import { migrateLegacy, isLegacyBundle } from "./migrate.js";
+import { customerMatches } from "./search.js";
 import { isEncryptedBackup, encryptSnapshot, decryptSnapshot } from "./backup.js";
 import { compressImageFile } from "./images.js";
+import { formatPhoneUS } from "./contact.js";
+import { normalizeLayout, jobFieldsFromLayout, layoutStats, summaryLines } from "./layout.js";
 
 const FAIL = "This phone wouldn't store that change. Export a backup from Settings before you keep going.";
 
@@ -54,15 +57,24 @@ export async function saveCustomer(input) {
   const name = String(input.name || "").trim();
   if (!name) return { ok: false, error: "Enter a customer name." };
   const existing = input.id ? state.customers.find((c) => c.id === input.id) : null;
+  const dupes = customerMatches(state.customers, name).filter((c) => c.id !== existing?.id);
+  if (dupes.length && !input.allowDuplicate) {
+    return {
+      ok: false,
+      duplicate: true,
+      error: "A customer named " + name + " is already on this phone. Save again to add another with the same name."
+    };
+  }
   const record = {
     id: existing?.id || uid(),
     name,
-    phone: String(input.phone || "").trim(),
-    email: String(input.email || "").trim(),
-    address: String(input.address || "").trim(),
+    phone: formatPhoneUS(input.phone),
+    email: String(input.email || "").trim().toLowerCase(),
+    address: String(input.address || "").trim().replace(/\s*\n\s*/g, ", "),
     notes: String(input.notes || ""),
     createdAt: existing?.createdAt || nowIso()
   };
+  if (record.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(record.email)) return { ok: false, error: "That email doesn't look right. Check it or leave it blank." };
   try {
     await saveRecord("customers", record, { prepend: !existing });
   } catch (error) {
@@ -117,6 +129,7 @@ export async function saveJob(input) {
     laborCostCents: Math.max(0, Number(input.laborCostCents) || 0),
     otherCostCents: Math.max(0, Number(input.otherCostCents) || 0),
     depositPercent: Math.min(100, Math.max(0, Number(input.depositPercent) || 0)),
+    layout: input.layout !== undefined ? normalizeLayout(input.layout) : existing?.layout || null,
     legacyStatus: existing?.legacyStatus || "",
     legacySalesDate: existing?.legacySalesDate || "",
     createdAt: existing?.createdAt || nowIso()
@@ -208,7 +221,7 @@ export async function savePayment(input) {
     id: existing?.id || input.id || uid(),
     jobId: job.id,
     customerId: job.customerId,
-    invoiceId: input.invoiceId || existing?.invoiceId || onlyInvoiceId(job.id),
+    invoiceId: input.invoiceId || existing?.invoiceId || onlyInvoiceId(job.id) || oldestUnpaidInvoiceId(state.invoices, state.payments.filter((p) => p.id !== existing?.id), job.id),
     amountCents: amount,
     date: input.date,
     method: methods.includes(input.method) ? input.method : "cash",
@@ -257,7 +270,7 @@ function cleanLines(lines) {
       id: line.id || uid(),
       priceBookId: line.priceBookId || "",
       description: String(line.description || "").trim(),
-      unit: line.unit === "each" ? "each" : "sqft",
+      unit: line.unit === "each" || line.unit === "lf" ? line.unit : "sqft",
       qty: Number(line.qty) || 0,
       unitPriceCents: Math.max(0, Number(line.unitPriceCents) || 0)
     }))
@@ -287,6 +300,7 @@ export async function saveDocument(kind, input) {
       taxRate: Math.min(50, Math.max(0, Number(input.taxRate) || 0)),
       depositPercent: Math.min(100, Math.max(0, Number(input.depositPercent) || 0)),
       notes: String(input.notes || ""),
+      sourceEstimateId: input.sourceEstimateId || existing?.sourceEstimateId || "",
       createdAt: existing?.createdAt || nowIso()
     };
     await saveRecord(store, record, { prepend: !existing });
@@ -315,7 +329,7 @@ export async function convertEstimateToJob(id) {
   }
   const customer = state.customers.find((row) => row.id === estimate.customerId);
   const totals = docTotals(estimate);
-  const sqft = (estimate.lines || []).filter((line) => line.unit === "sqft").reduce((sum, line) => sum + (Number(line.qty) || 0), 0);
+  const sqft = estimateCountertopSqft(estimate.lines, state.priceBook);
   const created = await saveJob({
     customerId: estimate.customerId,
     title: estimate.lines?.[0]?.description || "Countertop",
@@ -340,11 +354,26 @@ export async function convertEstimateToJob(id) {
   return { ok: true, id: created.id };
 }
 
-export async function createInvoiceFromEstimate(id) {
+export function estimateCountertopSqft(lines, priceBook = []) {
+  const sqftLines = (lines || []).filter((line) => line.unit === "sqft" && Number(line.qty) > 0);
+  const category = (line) => (priceBook || []).find((item) => item.id === line.priceBookId)?.category || "";
+  const isExtra = (line) => /edge|splash|backsplash|cutout|service/i.test(category(line)) || /splash|edge|cutout|seam/i.test(line.description || "");
+  const material = sqftLines.filter((line) => !isExtra(line));
+  return (material.length ? material : sqftLines.slice(0, 1)).reduce((sum, line) => sum + (Number(line.qty) || 0), 0);
+}
+
+export function invoiceForEstimate(estimateId) {
+  return state.invoices.find((inv) => inv.sourceEstimateId === estimateId && inv.status !== "void") || null;
+}
+
+export async function createInvoiceFromEstimate(id, { additional = false } = {}) {
   const estimate = state.estimates.find((doc) => doc.id === id);
   if (!estimate) return { ok: false, error: "That estimate is gone." };
   if (!estimate.customerId) return { ok: false, error: "Add a customer to this estimate first." };
+  const already = invoiceForEstimate(id);
+  if (already && !additional) return { ok: true, id: already.id, existing: true };
   const created = await saveDocument("invoice", {
+    sourceEstimateId: estimate.id,
     customerId: estimate.customerId,
     jobId: estimate.jobId || "",
     status: "open",
@@ -376,9 +405,13 @@ export async function createInvoiceFromEstimate(id) {
   return created;
 }
 
-export async function createInvoiceFromJob(jobId) {
+export async function createInvoiceFromJob(jobId, { additional = false } = {}) {
   const job = state.jobs.find((row) => row.id === jobId);
   if (!job) return { ok: false, error: "That job is gone." };
+  if (!additional) {
+    const existing = latestActiveInvoice(state.invoices, jobId);
+    if (existing) return { ok: true, id: existing.id, existing: true };
+  }
   const source = state.estimates
     .filter((doc) => doc.jobId === jobId && doc.status !== "declined")
     .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))[0];
@@ -401,7 +434,7 @@ export async function createInvoiceFromJob(jobId) {
     discountType: source?.discountType || "amount",
     discountCents: source?.discountCents || 0,
     discountPercent: source?.discountPercent || 0,
-    taxRate: source?.taxRate ?? state.business.taxRate,
+    taxRate: taxRateForContractInvoice(source, state.business.taxRate),
     depositPercent: source?.depositPercent ?? job.depositPercent ?? state.business.defaultDepositPercent,
     notes: source?.notes || ""
   });
@@ -460,7 +493,7 @@ export async function savePriceItem(input) {
     id: existing?.id || uid(),
     name,
     category: String(input.category || "Material").trim() || "Material",
-    unit: input.unit === "each" ? "each" : "sqft",
+    unit: input.unit === "each" || input.unit === "lf" ? input.unit : "sqft",
     unitPriceCents: Math.max(0, Number(input.unitPriceCents) || 0),
     active: input.active !== false,
     starter: false,
@@ -519,12 +552,20 @@ export async function toggleTask(id) {
 }
 
 export async function deleteTask(id) {
+  let prev = null;
   try {
-    await deleteRecord("tasks", id);
+    prev = await deleteRecord("tasks", id);
   } catch (error) {
     return storageFail(error);
   }
-  return { ok: true };
+  return {
+    ok: true,
+    undo: prev
+      ? async () => {
+          await saveRecord("tasks", prev, { prepend: true });
+        }
+      : null
+  };
 }
 
 export async function saveBusiness(input) {
@@ -669,7 +710,7 @@ export function csvRows(kind) {
     ];
   }
   return [
-    ["Customer", "Phone", "Email", "Site address", "Stage", "Material", "Color", "Edge", "Sink", "Cutouts", "Backsplash", "Sq ft", "Template date", "Install date", "Job total", "Material cost", "Labor cost", "Other cost", "Profit", "Paid", "Balance", "Notes"],
+    ["Customer", "Phone", "Email", "Site address", "Stage", "Material", "Color", "Edge", "Sink", "Cutouts", "Backsplash", "Sq ft", "Template date", "Install date", "Job total", "Material cost", "Labor cost", "Other cost", "Profit", "Paid", "Balance", "Layout", "Notes"],
     ...state.jobs.map((job) => {
       const customer = state.customers.find((c) => c.id === job.customerId);
       const revenue = jobRevenueCents(job, state.invoices);
@@ -695,6 +736,7 @@ export function csvRows(kind) {
         (profitCents(job, state.invoices) / 100).toFixed(2),
         (paidCents(state.payments, job.id) / 100).toFixed(2),
         (balanceCents(job, state.invoices, state.payments) / 100).toFixed(2),
+        job.layout?.pieces?.length ? summaryLines(layoutStats(job.layout)).join("; ").replace(/\u2033/g, '"') : "",
         job.notes
       ];
     })
@@ -708,6 +750,80 @@ export function moneySummary(job) {
     balance: balanceCents(job, state.invoices, state.payments),
     profit: profitCents(job, state.invoices),
     costs: costCents(job)
+  };
+}
+
+export async function addJobMaterialCost(jobId, cents) {
+  const job = state.jobs.find((row) => row.id === jobId);
+  const add = Math.max(0, Number(cents) || 0);
+  if (!job) return { ok: false, error: "That job is gone." };
+  if (!add) return { ok: true, id: job.id };
+  const prev = job.materialCostCents || 0;
+  job.materialCostCents = prev + add;
+  try {
+    const saved = await db.put("jobs", { ...job, updatedAt: nowIso() });
+    Object.assign(job, saved);
+  } catch (error) {
+    job.materialCostCents = prev;
+    return storageFail(error);
+  }
+  return { ok: true, id: job.id };
+}
+
+export async function savePhotoCaption(id, caption) {
+  const photo = state.photos.find((row) => row.id === id);
+  if (!photo) return { ok: false, error: "That photo is gone." };
+  const prev = photo.caption || "";
+  photo.caption = String(caption || "").trim();
+  try {
+    const saved = await db.putPhoto({ ...photo });
+    Object.assign(photo, saved);
+  } catch (error) {
+    photo.caption = prev;
+    return storageFail(error);
+  }
+  return { ok: true };
+}
+
+export async function saveJobLayout(jobId, layout) {
+  const job = state.jobs.find((row) => row.id === jobId);
+  if (!job) return { ok: false, error: "That job is gone." };
+  const prev = job.layout || null;
+  const next = layout ? normalizeLayout({ ...layout, updatedAt: nowIso() }) : null;
+  job.layout = next;
+  try {
+    const saved = await db.put("jobs", { ...job, updatedAt: nowIso() });
+    Object.assign(job, saved);
+  } catch (error) {
+    job.layout = prev;
+    return storageFail(error);
+  }
+  return { ok: true };
+}
+
+// Copy the drawing's numbers onto the job: square feet, sink cutouts, sink type, backsplash.
+export async function applyLayoutToJob(jobId) {
+  const job = state.jobs.find((row) => row.id === jobId);
+  if (!job) return { ok: false, error: "That job is gone." };
+  if (!job.layout?.pieces?.length) return { ok: false, error: "Draw at least one countertop piece first." };
+  const fields = jobFieldsFromLayout(job.layout);
+  const prev = { sqft: job.sqft ?? null, sinkCutouts: job.sinkCutouts || "", sinkType: job.sinkType || "", backsplash: job.backsplash || "" };
+  Object.assign(job, { sqft: fields.sqft, sinkCutouts: fields.sinkCutouts, sinkType: fields.sinkType, backsplash: fields.backsplash });
+  try {
+    const saved = await db.put("jobs", { ...job, updatedAt: nowIso() });
+    Object.assign(job, saved);
+  } catch (error) {
+    Object.assign(job, prev);
+    return storageFail(error);
+  }
+  return {
+    ok: true,
+    fields,
+    undo: async () => {
+      Object.assign(job, prev);
+      const saved = await db.put("jobs", { ...job, updatedAt: nowIso() });
+      Object.assign(job, saved);
+    }
   };
 }
 

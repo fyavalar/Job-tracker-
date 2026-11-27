@@ -1,14 +1,16 @@
 import { state, customerById } from "../state.js";
 import { saveBusiness, savePriceItem, deletePriceItem, saveTask, toggleTask, deleteTask, buildBackup, restoreBackup, csvRows } from "../actions.js";
 import { icon } from "../icons.js";
-import { empty, err, field, section, selectField } from "../components.js";
-import { esc, centsToInput, downloadBlob, money, niceDate, parseDollarsToCents, parsePercent, plural, todayISO } from "../format.js";
+import { empty, err, field, section, selectField, segmented } from "../components.js";
+import { confirmSheet } from "../sheet.js";
+import { esc, centsToInput, downloadBlob, lastBackupTime, money, niceDate, parseDollarsToCents, parsePercent, plural, rememberBackupTime, shareOrDownload, todayISO } from "../format.js";
 import { csvBlob } from "../csv.js";
 import { searchAll } from "../search.js";
+import { handlePhoneInput } from "../customer-ui.js";
 import { jobTitle, docNumber, APP_VERSION } from "../model.js";
 import { docTotals } from "../calc.js";
 import { fileToJpegDataUrl } from "../images.js";
-import { currentTheme, go, render, setTheme, toast } from "../nav.js";
+import { currentTheme, go, goBackTo, render, setTheme, toast, markSaved } from "../nav.js";
 
 const links = [
   ["#/customers", "user", "Customers", "People, and every job they have"],
@@ -21,13 +23,20 @@ const links = [
   ["#/settings", "gear", "Settings", "Business, backup, and theme"]
 ];
 
+function themeSeg(theme) {
+  return segmented([["system", "Automatic"], ["light", "Light"], ["dark", "Dark"]], theme, "theme", { label: "Theme", attr: "theme" });
+}
+
 export const more = {
   root: true,
   title: () => "More",
   html() {
     const theme = currentTheme();
-    return `<div class="seg" aria-label="Theme">${["system", "light", "dark"].map((item) => `<button type="button" class="${theme === item ? "is-on" : ""}" data-act="theme" data-theme="${item}">${item[0].toUpperCase() + item.slice(1)}</button>`).join("")}</div>
-      <div class="menu">${links.map(([href, name, label, text]) => `<a href="${href}">${icon(name)}<span><strong>${label}</strong><small>${text}</small></span></a>`).join("")}</div>`;
+    const count = { "#/customers": state.customers.length, "#/estimates": state.estimates.length, "#/invoices": state.invoices.length, "#/inventory": state.slabs.filter((s) => s.status !== "used").length, "#/tasks": state.tasks.filter((t) => !t.done).length };
+    const groups = [links.slice(0, 3), links.slice(3, 6), links.slice(6)];
+    return groups.map((g) => `<div class="menu">${g.map(([href, name, label, text]) => `<a href="${href}"><span class="menu-ico" data-ico="${name}">${icon(name)}</span><span class="row-text"><strong>${label}</strong><small>${text}</small></span>${count[href] ? `<span class="menu-n">${count[href]}</span>` : ""}${icon("chevronRight")}</a>`).join("")}</div>`).join("") +
+      section("Appearance", themeSeg(theme), { className: "plain" }) +
+      `<p class="meta small center">JOBS ${esc(APP_VERSION)} · Works offline · Records stay on this phone</p>`;
   },
   onClick(act, el) {
     if (act !== "theme") return;
@@ -39,14 +48,19 @@ export const more = {
 let priceKey = "";
 let priceWorking = null;
 
+function unitLabel(unit) {
+  return unit === "sqft" ? "per sq ft" : unit === "lf" ? "per linear ft" : "each";
+}
+
 export const prices = {
   title: () => "Price book",
   back: () => "#/more",
+  action: () => `<a class="icon-btn" href="#/price-book/new" aria-label="Add price">${icon("plus")}</a>`,
   html() {
     const rows = state.priceBook.slice().sort((a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name));
     const starter = rows.some((item) => item.starter);
-    return `${starter ? `<p class="banner">Starter prices are placeholders. Change them to your numbers before you send a quote.</p>` : ""}
-      ${rows.map((item) => `<a class="card card-link" href="#/price-book/${esc(item.id)}"><div class="card-top"><strong>${esc(item.name)}</strong><b>${esc(money(item.unitPriceCents))}</b></div><div class="meta">${esc(item.category)} · ${item.unit === "sqft" ? "per sq ft" : "each"}${item.starter ? " · Starter" : ""}</div></a>`).join("")}
+    return `${starter ? `<p class="banner warn">Starter prices are placeholders. Change them to your numbers before you send a quote.</p>` : ""}
+      ${[...new Set(rows.map((r) => r.category))].map((cat) => section(cat, `<div class="list">${rows.filter((r) => r.category === cat).map((item) => `<a class="row-main" href="#/price-book/${esc(item.id)}"><span class="row-text"><strong>${esc(item.name)}</strong><small>${unitLabel(item.unit)}${item.starter ? " · Starter price" : ""}</small></span><b class="row-amt">${esc(money(item.unitPriceCents))}</b>${icon("chevronRight")}</a>`).join("")}</div>`)).join("") || empty("No prices yet", "Add the prices you quote most so estimates fill in fast.", { art: "doc" })}
       <a class="btn primary block" href="#/price-book/new">${icon("plus")} Add price</a>`;
   }
 };
@@ -65,18 +79,18 @@ export const priceForm = {
         priceWorking = item ? { id: item.id, name: item.name, category: item.category, unit: item.unit, price: centsToInput(item.unitPriceCents), error: "", confirm: false } : null;
       }
     }
-    if (!priceWorking) return empty("That price isn't in the book", "It may have been deleted.");
-    return `<form id="price-form">
-      ${section("Price", [
-        field({ label: "Name", name: "name", value: priceWorking.name }),
-        field({ label: "Category", name: "category", value: priceWorking.category, list: "price-cats" }),
-        selectField({ label: "Unit", name: "unit", value: priceWorking.unit, options: [{ value: "sqft", label: "Per square foot" }, { value: "each", label: "Each" }] }),
-        field({ label: "Price", name: "price", value: priceWorking.price, inputmode: "decimal" })
-      ].join(""))}
+    if (!priceWorking) return empty("That price isn't in the book", "It may have been deleted.", { art: "doc" });
+    return `<form id="price-form" data-guard novalidate>
+      ${section("Price", `<div class="form-stack">${[
+        field({ label: "Name", name: "name", value: priceWorking.name, autocapitalize: "words", placeholder: "Quartz, level 2" }),
+        field({ label: "Category", name: "category", value: priceWorking.category, list: "price-cats", autocapitalize: "words" }),
+        selectField({ label: "Unit", name: "unit", value: priceWorking.unit, options: [{ value: "sqft", label: "Per square foot" }, { value: "lf", label: "Per linear foot" }, { value: "each", label: "Each" }] }),
+        field({ label: "Price", name: "price", value: priceWorking.price, inputmode: "decimal", currency: true, enterkeyhint: "done" })
+      ].join("")}</div>`, { className: "form-group" })}
       <datalist id="price-cats"><option value="Material"></option><option value="Edge"></option><option value="Cutout"></option><option value="Backsplash"></option><option value="Service"></option></datalist>
       ${err(priceWorking.error)}
-      <button class="btn primary block" type="submit">Save price</button>
-      ${priceWorking.id ? `<button type="button" class="btn danger block" data-act="delete">${priceWorking.confirm ? "Delete this price" : "Delete"}</button>` : ""}
+      <div class="form-bar"><button class="btn primary block" type="submit">Save price</button></div>
+      ${priceWorking.id ? `<button type="button" class="btn danger-ghost block" data-act="delete">${icon("trash")} Delete price</button>` : ""}
     </form>`;
   },
   async onSubmit(event) {
@@ -91,22 +105,25 @@ export const priceForm = {
       priceWorking = { ...priceWorking, ...data, error: result.error };
       return render({ keepScroll: true });
     }
+    const creating = !priceWorking.id;
     priceKey = "";
     toast("Price saved");
-    go("/price-book");
+    if (creating) return go("/price-book", { replace: true, force: true });
+    return goBackTo("/price-book", { force: true });
+  },
+  leave() {
+    priceKey = "";
+    priceWorking = null;
   },
   async onClick(act) {
     if (act !== "delete" || !priceWorking?.id) return;
-    if (!priceWorking.confirm) {
-      const data = Object.fromEntries(new FormData(document.getElementById("price-form")).entries());
-      priceWorking = { ...priceWorking, ...data, confirm: true };
-      return render({ keepScroll: true });
-    }
+    const ok = await confirmSheet({ title: "Delete this price?", message: "Estimates that already use it keep their numbers.", confirm: "Delete price" });
+    if (!ok) return;
     const result = await deletePriceItem(priceWorking.id);
     if (!result.ok) return toast(result.error);
     priceKey = "";
     toast("Price deleted");
-    go("/price-book");
+    goBackTo("/price-book", { force: true });
   }
 };
 
@@ -118,16 +135,22 @@ export const tasks = {
   html() {
     const rows = state.tasks.slice().sort((a, b) => Number(a.done) - Number(b.done) || (a.dueDate || "9999").localeCompare(b.dueDate || "9999"));
     const customers = state.customers.slice().sort((a, b) => a.name.localeCompare(b.name));
-    return `<form id="task-form">
-      ${field({ label: "What needs doing", name: "title", value: taskQuery.title })}
-      ${field({ label: "Due date", name: "dueDate", value: taskQuery.dueDate, type: "date" })}
-      ${selectField({ label: "Customer", name: "customerId", value: taskQuery.customerId, options: [{ value: "", label: "None" }, ...customers.map((c) => ({ value: c.id, label: c.name }))] })}
-      ${field({ label: "Notes", name: "notes", value: taskQuery.notes, multiline: true, rows: 3 })}
+    const today = todayISO();
+    const open = taskQuery.title || taskQuery.notes || taskQuery.dueDate || taskQuery.customerId || taskQuery.error;
+    return `<form id="task-form" class="group form-group" novalidate>
+      <div class="task-add">${field({ label: "New task", name: "title", value: taskQuery.title, placeholder: "Call Maria about the seam", autocapitalize: "sentences", enterkeyhint: "done" })}<button class="btn primary" type="submit" aria-label="Add task">${icon("plus")}</button></div>
+      <details class="more-fields"${open ? " open" : ""}><summary>Due date, customer, notes ${icon("chevronDown")}</summary><div class="form-stack">
+      <div class="two-col">${field({ label: "Due date", name: "dueDate", value: taskQuery.dueDate, type: "date" })}${selectField({ label: "Customer", name: "customerId", value: taskQuery.customerId, options: [{ value: "", label: "None" }, ...customers.map((c) => ({ value: c.id, label: c.name }))] })}</div>
+      ${field({ label: "Notes", name: "notes", value: taskQuery.notes, multiline: true, rows: 2, autocapitalize: "sentences" })}
+      </div></details>
       ${err(taskQuery.error)}
-      <button class="btn primary block" type="submit">Add task</button>
     </form>
-    <div class="stack">${rows.map((task) => `<article class="card"><button type="button" class="check${task.done ? " is-on" : ""}" data-act="toggle" data-id="${esc(task.id)}"><span class="box">${task.done ? "✓" : ""}</span><span><strong class="${task.done ? "done" : ""}">${esc(task.title)}</strong>${task.dueDate ? `<small>${esc(niceDate(task.dueDate, { year: true }))}</small>` : ""}${task.notes ? `<small>${esc(task.notes)}</small>` : ""}</span></button><button type="button" class="text-btn" data-act="delete" data-id="${esc(task.id)}">Delete</button></article>`).join("")}</div>
-    ${rows.length ? "" : `<p class="meta">No tasks. These stay on this phone. The app does not send reminders.</p>`}`;
+    ${rows.length ? `<div class="list">${rows.map((task) => {
+      const who = task.customerId ? customerById(task.customerId)?.name : "";
+      const late = !task.done && task.dueDate && task.dueDate < today;
+      const sub = [task.dueDate ? (late ? "Overdue · " : task.dueDate === today ? "Today · " : "") + niceDate(task.dueDate, { weekday: true }) : "", who, task.notes].filter(Boolean).join(" · ");
+      return `<div class="row task-row${task.done ? " is-done" : ""}"><button type="button" class="check" data-act="toggle" data-id="${esc(task.id)}" aria-pressed="${task.done}" aria-label="${task.done ? "Mark not done" : "Mark done"}: ${esc(task.title)}"><span class="box">${task.done ? icon("check") : ""}</span><span class="row-text"><strong>${esc(task.title)}</strong>${sub ? `<small class="${late ? "neg" : ""}">${esc(sub)}</small>` : ""}</span></button><button type="button" class="row-act" data-act="delete" data-id="${esc(task.id)}" aria-label="Delete ${esc(task.title)}">${icon("trash")}</button></div>`;
+    }).join("")}</div>` : empty("No tasks", "Notes to yourself. They stay on this phone — the app doesn't send reminders.", { art: "check" })}`;
   },
   async onSubmit(event) {
     const data = Object.fromEntries(new FormData(event.target).entries());
@@ -138,23 +161,32 @@ export const tasks = {
     }
     taskQuery = { title: "", dueDate: "", notes: "", customerId: "", error: "" };
     toast("Task added");
-    render();
+    render({ keepScroll: true });
   },
   async onClick(act, el) {
+    // keep whatever is half-typed in the add form across the re-render
+    const formEl = document.getElementById("task-form");
+    if (formEl) taskQuery = { ...taskQuery, ...Object.fromEntries(new FormData(formEl).entries()), error: "" };
     if (act === "toggle") {
       const result = await toggleTask(el.dataset.id);
-      if (!result.ok) return toast(result.error);
+      if (!result.ok) return toast(result.error || "Couldn't update that task.");
       return render({ keepScroll: true });
     }
     if (act === "delete") {
       const result = await deleteTask(el.dataset.id);
       if (!result.ok) return toast(result.error);
+      toast("Task deleted", result.undo);
       render({ keepScroll: true });
     }
   }
 };
 
 let settingsWorking = null;
+
+function captureSettings() {
+  const formEl = document.getElementById("settings-form");
+  if (formEl && settingsWorking) settingsWorking = { ...settingsWorking, ...Object.fromEntries(new FormData(formEl).entries()) };
+}
 let settingsKey = "";
 let backupPass = "";
 let restorePass = "";
@@ -183,38 +215,35 @@ export const settings = {
       };
     }
     const theme = currentTheme();
-    const staged = restoreRaw && restoreArmed ? `<div id="restore-summary"><p>${esc(restoreNote)}</p><button type="button" class="btn danger" data-act="do-restore">Replace my records</button><button type="button" class="btn" data-act="cancel-restore">Cancel</button></div>` : "";
-    return `<form id="settings-form">
-      ${section("Business", [
-        field({ label: "Business name", name: "name", value: settingsWorking.name }),
-        field({ label: "Phone", name: "phone", value: settingsWorking.phone, type: "tel", inputmode: "tel" }),
-        field({ label: "Email", name: "email", value: settingsWorking.email, type: "email", inputmode: "email" }),
-        field({ label: "Address", name: "address", value: settingsWorking.address, multiline: true, rows: 3 }),
-        `<label class="field"><span class="lbl">Logo</span><input id="logo-file" type="file" accept="image/*"></label>`,
-        settingsWorking.logoDataUrl ? `<img class="logo-preview" alt="Business logo" src="${esc(settingsWorking.logoDataUrl)}"><button type="button" class="text-btn" data-act="clear-logo">Remove logo</button>` : ""
-      ].join(""))}
-      ${section("Money defaults", [
-        field({ label: "Tax percent", name: "taxRate", value: settingsWorking.taxRate, inputmode: "decimal" }),
-        field({ label: "Default deposit percent", name: "defaultDepositPercent", value: settingsWorking.defaultDepositPercent, inputmode: "decimal" }),
-        field({ label: "Footer on estimates and invoices", name: "documentFooter", value: settingsWorking.documentFooter, multiline: true, rows: 3 }),
-        `<p class="meta">New estimates use these. Florida shops often add county surtax on top of the state rate. Set the percent you actually charge.</p>`
-      ].join(""))}
+    const staged = restoreRaw && restoreArmed ? `<div class="banner warn" id="restore-summary"><p>${esc(restoreNote)}</p><div class="btn-row"><button type="button" class="btn danger-solid" data-act="do-restore">Replace my records</button><button type="button" class="btn" data-act="cancel-restore">Cancel</button></div></div>` : "";
+    return `<form id="settings-form" data-guard novalidate>
+      ${section("Business", `<div class="form-stack">${[
+        field({ label: "Business name", name: "name", value: settingsWorking.name, autocomplete: "organization", autocapitalize: "words" }),
+        `<div class="two-col">${field({ label: "Phone", name: "phone", value: settingsWorking.phone, type: "tel", inputmode: "tel", autocomplete: "tel", data: { phone: "1" } })}${field({ label: "Email", name: "email", value: settingsWorking.email, type: "email", inputmode: "email", autocomplete: "email", autocapitalize: "off", spellcheck: false })}</div>`,
+        field({ label: "Address", name: "address", value: settingsWorking.address, multiline: true, rows: 2, autocomplete: "street-address", autocapitalize: "words" }),
+        `<div class="logo-row">${settingsWorking.logoDataUrl ? `<img class="logo-preview" alt="Business logo" src="${esc(settingsWorking.logoDataUrl)}">` : `<span class="logo-ph">${icon("camera")}</span>`}<div class="logo-btns"><label class="btn sm" for="logo-file">${settingsWorking.logoDataUrl ? "Change logo" : "Add logo"}</label>${settingsWorking.logoDataUrl ? `<button type="button" class="text-btn" data-act="clear-logo">Remove</button>` : ""}</div><input id="logo-file" type="file" accept="image/*" hidden></div>`
+      ].join("")}</div>`, { className: "form-group" })}
+      ${section("Money defaults", `<div class="form-stack">${[
+        `<div class="two-col">${field({ label: "Tax", name: "taxRate", value: settingsWorking.taxRate, inputmode: "decimal", suffix: "%" })}${field({ label: "Deposit", name: "defaultDepositPercent", value: settingsWorking.defaultDepositPercent, inputmode: "decimal", suffix: "%" })}</div>`,
+        field({ label: "Footer on estimates and invoices", name: "documentFooter", value: settingsWorking.documentFooter, multiline: true, rows: 3, autocapitalize: "sentences" }),
+        `<p class="hint">New estimates use these. Florida shops often add county surtax on top of the state rate — set the percent you actually charge.</p>`
+      ].join("")}</div>`, { className: "form-group" })}
       ${err(settingsWorking.error)}
-      <button class="btn primary block" type="submit">Save settings</button>
+      <div class="form-bar"><button class="btn primary block" type="submit">Save settings</button></div>
     </form>
-    ${section("Theme", `<div class="seg">${["system", "light", "dark"].map((item) => `<button type="button" class="${theme === item ? "is-on" : ""}" data-act="theme" data-theme="${item}">${item[0].toUpperCase() + item.slice(1)}</button>`).join("")}</div>`)}
-    ${section("Export CSV", `<div class="btn-col"><button type="button" class="btn" data-act="csv" data-kind="jobs">Jobs</button><button type="button" class="btn" data-act="csv" data-kind="customers">Customers</button><button type="button" class="btn" data-act="csv" data-kind="payments">Payments</button></div>`)}
-    ${section("Backup", `<p class="meta">Records stay on this phone until you export them. A passphrase scrambles the file. You will need the same passphrase to restore it, so keep it somewhere that is not only this phone. Leave it blank for a plain file.</p>
-      <label class="field"><span class="lbl">Passphrase</span><input id="backup-pass" type="password" autocomplete="new-password" value="${esc(backupPass)}"></label>
-      <button type="button" class="btn primary" data-act="backup">Download backup</button>
+    ${section("Appearance", themeSeg(theme))}
+    ${section("Export CSV", `<div class="btn-row three"><button type="button" class="btn" data-act="csv" data-kind="jobs">Jobs</button><button type="button" class="btn" data-act="csv" data-kind="customers">Customers</button><button type="button" class="btn" data-act="csv" data-kind="payments">Payments</button></div>`)}
+    ${section("Backup", `<p class="meta">${esc(backupReminder())}</p>
+      <p class="hint">Layouts, photos and paperwork are included. A passphrase scrambles the file; you'll need it to restore, so keep it somewhere besides this phone. Leave blank for a plain file.</p>
+      <label class="field"><span class="lbl">Passphrase (optional)</span><input id="backup-pass" type="password" autocomplete="new-password" value="${esc(backupPass)}"></label>
+      <button type="button" class="btn primary block" data-act="backup">${icon("download")} Export backup</button>
       <p class="err" id="backup-error" hidden></p>`)}
-    ${section("Restore", `<p class="meta">Restoring replaces the customers, jobs, and paperwork on this phone. It also accepts a backup from the previous JOBS app.</p>
-      <label class="field"><span class="lbl">Backup file</span><input id="restore-file" type="file" accept="application/json,.json,text/plain"></label>
-      ${restoreName ? `<p class="meta">${esc(restoreName)}</p>` : ""}
+    ${section("Restore", `<p class="hint">Restoring replaces the customers, jobs, and paperwork on this phone. It also accepts a backup from the previous JOBS app.</p>
+      <label class="btn block file-btn" for="restore-file">${icon("upload")} ${restoreName ? esc(restoreName) : "Choose backup file"}</label><input id="restore-file" type="file" accept="application/json,.json,text/plain" hidden>
       <label class="field"><span class="lbl">Passphrase, if the file is encrypted</span><input id="restore-pass" type="password" autocomplete="current-password" value="${esc(restorePass)}"></label>
-      ${restoreError ? `<p class="err">${esc(restoreError)}</p>` : ""}
-      ${staged || `<button type="button" class="btn danger" data-act="stage-restore">Review backup</button>`}`)}
-    <p class="meta">JOBS ${APP_VERSION}. Works offline. Cloud sync is not turned on. After an update, open this site once in Safari, then use the home screen icon.</p>`;
+      ${restoreError ? err(restoreError) : ""}
+      ${staged || `<button type="button" class="btn danger-ghost block" data-act="stage-restore">Review backup</button>`}`)}
+    <p class="meta small center">JOBS ${esc(APP_VERSION)} · Works offline · Cloud sync is off. After an update, open the site once in Safari, then use the home screen icon.</p>`;
   },
   async onSubmit(event) {
     const data = Object.fromEntries(new FormData(event.target).entries());
@@ -231,9 +260,15 @@ export const settings = {
     }
     settingsWorking = { ...settingsWorking, ...data, error: "" };
     toast("Settings saved");
+    markSaved();
     render({ keepScroll: true });
   },
+  leave() {
+    settingsKey = "";
+    settingsWorking = null;
+  },
   onInput(event) {
+    if (event.target.dataset?.phone) handlePhoneInput(event);
     if (event.target.id === "backup-pass") backupPass = event.target.value;
     if (event.target.id === "restore-pass") {
       restorePass = event.target.value;
@@ -254,6 +289,7 @@ export const settings = {
       return render({ keepScroll: true });
     }
     if (event.target.id === "restore-file" && event.target.files?.[0]) {
+      captureSettings();
       restoreName = event.target.files[0].name;
       try {
         restoreRaw = JSON.parse(await event.target.files[0].text());
@@ -268,6 +304,8 @@ export const settings = {
     }
   },
   async onClick(act, el) {
+    // every re-render below keeps unsaved business fields
+    captureSettings();
     if (act === "clear-logo") {
       settingsWorking.logoDataUrl = "";
       return render({ keepScroll: true });
@@ -278,8 +316,10 @@ export const settings = {
     }
     if (act === "csv") {
       const kind = el.dataset.kind;
-      downloadBlob(csvBlob(csvRows(kind)), "jobs-" + kind + "-" + todayISO() + ".csv");
-      toast("CSV downloaded");
+      const name = "jobs-" + kind + "-" + todayISO() + ".csv";
+      const how = await shareOrDownload(csvBlob(csvRows(kind)), name, name);
+      if (how === "shared") toast("CSV ready to share");
+      else if (how === "downloaded") toast("CSV downloaded");
       return;
     }
     if (act === "backup") {
@@ -294,9 +334,13 @@ export const settings = {
         }
         return;
       }
-      downloadBlob(new Blob([JSON.stringify(result.data, null, 2)], { type: "application/json" }), (result.encrypted ? "jobs-backup-encrypted-" : "jobs-backup-") + todayISO() + ".json");
-      toast(result.encrypted ? "Encrypted backup downloaded" : "Backup downloaded");
-      return;
+      const name = (result.encrypted ? "jobs-backup-encrypted-" : "jobs-backup-") + todayISO() + ".json";
+      const how = await shareOrDownload(new Blob([JSON.stringify(result.data, null, 2)], { type: "application/json" }), name, name);
+      if (how === "aborted") return;
+      rememberBackupTime();
+      if (how === "shared") toast(result.encrypted ? "Encrypted backup ready to share" : "Backup ready to share");
+      else toast(result.encrypted ? "Encrypted backup downloaded" : "Backup downloaded");
+      return render({ keepScroll: true });
     }
     if (act === "stage-restore") {
       if (!restoreRaw) {
@@ -317,6 +361,8 @@ export const settings = {
       return render({ keepScroll: true });
     }
     if (act === "do-restore") {
+      const ok = await confirmSheet({ title: "Replace everything on this phone?", message: restoreNote + " This can't be undone, so export a backup first if you're unsure.", confirm: "Replace my records" });
+      if (!ok) return;
       const result = await restoreBackup(restoreRaw, document.getElementById("restore-pass")?.value || restorePass);
       if (!result.ok) {
         restoreError = result.error;
@@ -327,8 +373,9 @@ export const settings = {
       restoreArmed = false;
       restoreName = "";
       settingsKey = "";
+      settingsWorking = null;
       toast("Restored " + plural(result.customers, "customer", "customers") + " and " + plural(result.jobs, "job", "jobs"));
-      return go("/");
+      return go("/", { replace: true, force: true });
     }
     if (act === "cancel-restore") {
       restoreArmed = false;
@@ -336,6 +383,16 @@ export const settings = {
     }
   }
 };
+
+function backupReminder() {
+  const stamp = lastBackupTime();
+  if (!stamp) return "No backup on this phone yet. Export one when you can.";
+  const day = stamp.slice(0, 10);
+  const label = niceDate(day, { year: true }) || day;
+  const age = Math.max(0, Math.floor((Date.now() - Date.parse(stamp)) / 86400000));
+  if (age >= 14) return "Last backup " + label + ". It's been a while — export a fresh one when you can.";
+  return "Last backup " + label + ".";
+}
 
 async function summarizeRestore(data, passphrase) {
   try {
@@ -362,7 +419,7 @@ export const search = {
   title: () => "Search",
   back: () => "#/",
   html() {
-    return `<div class="toolbar"><input id="q" placeholder="Customers, jobs, stone, invoices" value="${esc(searchText)}" aria-label="Search"></div><div id="results">${searchHtml(searchText)}</div>`;
+    return `<div class="search-field">${icon("search")}<input id="q" type="search" placeholder="Name, phone, stone, invoice #" value="${esc(searchText)}" aria-label="Search everything" autocomplete="off" enterkeyhint="search"></div><div id="results">${searchHtml(searchText)}</div>`;
   },
   mount(root) {
     const input = root.querySelector("#q");
@@ -381,17 +438,18 @@ export const search = {
 
 function searchHtml(q) {
   const found = searchAll(state, q);
-  if (!q.trim()) return `<p class="meta">Search names, phones, materials, invoice numbers, and stone.</p>`;
+  if (!q.trim()) return `<p class="meta center">Search names, phone numbers, stone, addresses, and invoice numbers.</p>`;
   const blocks = [];
+  const r = (href, title, sub, amt = "") => `<a class="row-main" href="${esc(href)}"><span class="row-text"><strong>${esc(title)}</strong>${sub ? `<small>${esc(sub)}</small>` : ""}</span>${amt ? `<b class="row-amt">${esc(amt)}</b>` : ""}${icon("chevronRight")}</a>`;
   const add = (title, rows) => {
     if (!rows.length) return;
-    blocks.push(`<h2>${esc(title)}</h2>` + rows);
+    blocks.push(section(title, `<div class="list">${rows.join("")}</div>`));
   };
-  add("Customers", found.customers.map((c) => `<a class="card card-link" href="#/customers/${esc(c.id)}"><strong>${esc(c.name)}</strong><div class="meta">${esc(c.phone || c.address || "")}</div></a>`).join(""));
-  add("Jobs", found.jobs.map((job) => `<a class="card card-link" href="#/jobs/${esc(job.id)}"><strong>${esc(customerById(job.customerId)?.name || "Customer")}</strong><div class="meta">${esc(jobTitle(job))}</div></a>`).join(""));
-  add("Estimates", found.estimates.map((doc) => `<a class="card card-link" href="#/estimates/${esc(doc.id)}"><strong>${esc(docNumber("estimate", doc.number))}</strong><div class="meta">${esc(money(docTotals(doc).total))}</div></a>`).join(""));
-  add("Invoices", found.invoices.map((doc) => `<a class="card card-link" href="#/invoices/${esc(doc.id)}"><strong>${esc(docNumber("invoice", doc.number))}</strong><div class="meta">${esc(money(docTotals(doc).total))}</div></a>`).join(""));
-  add("Inventory", found.slabs.map((slab) => `<a class="card card-link" href="#/inventory/${esc(slab.id)}"><strong>${esc(slab.stoneColor || slab.material)}</strong><div class="meta">${esc(slab.kind)}</div></a>`).join(""));
-  add("Tasks", found.tasks.map((task) => `<a class="card card-link" href="#/tasks"><strong>${esc(task.title)}</strong></a>`).join(""));
-  return blocks.join("") || `<p class="meta">Nothing matches.</p>`;
+  add("Customers", found.customers.map((c) => r("#/customers/" + c.id, c.name, c.phone || c.address || "")));
+  add("Jobs", found.jobs.map((job) => r("#/jobs/" + job.id, customerById(job.customerId)?.name || "Customer", jobTitle(job))));
+  add("Estimates", found.estimates.map((doc) => r("#/estimates/" + doc.id, docNumber("estimate", doc.number), customerById(doc.customerId)?.name || "", money(docTotals(doc).total))));
+  add("Invoices", found.invoices.map((doc) => r("#/invoices/" + doc.id, docNumber("invoice", doc.number), customerById(doc.customerId)?.name || "", money(docTotals(doc).total))));
+  add("Inventory", found.slabs.map((slab) => r("#/inventory/" + slab.id, slab.stoneColor || slab.material, slab.kind === "remnant" ? "Remnant" : "Slab")));
+  add("Tasks", found.tasks.map((task) => r("#/tasks", task.title, task.dueDate ? niceDate(task.dueDate, { weekday: true }) : "")));
+  return blocks.join("") || empty("Nothing matches", "No records match “" + q + "”.", { art: "search" });
 }

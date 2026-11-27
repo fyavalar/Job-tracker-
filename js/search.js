@@ -1,12 +1,18 @@
 import { docNumber, jobTitle } from "./model.js";
-import { normName } from "./format.js";
+import { normName, foldText, digits } from "./format.js";
 
+let qDigits = "";
+
+// Accent-insensitive text match, plus phone numbers match whatever punctuation was typed.
 function hit(parts, q) {
-  return parts.filter(Boolean).join(" ").toLowerCase().includes(q);
+  const text = parts.filter(Boolean).join(" ");
+  if (foldText(text).includes(q)) return true;
+  return qDigits.length >= 3 && digits(text).includes(qDigits);
 }
 
 export function searchAll(state, query) {
-  const q = String(query || "").trim().toLowerCase();
+  const q = foldText(String(query || "").trim()).replace(/\s+/g, " ");
+  qDigits = /^[\d\s().+-]+$/.test(String(query || "").trim()) ? digits(query) : "";
   const empty = { customers: [], jobs: [], estimates: [], invoices: [], slabs: [], tasks: [] };
   if (!q) return empty;
   const customerName = (id) => state.customers.find((c) => c.id === id)?.name || "";

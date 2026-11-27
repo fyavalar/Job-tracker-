@@ -148,8 +148,10 @@ function openLocalBackend() {
   const save = () => {
     try {
       localStorage.setItem(FALLBACK_KEY, JSON.stringify(data));
-    } catch {
-      /* The caller surfaces a save error if the write was a user action. */
+    } catch (error) {
+      const err = new Error("This phone is out of space for records. Export a backup and free some storage.");
+      err.cause = error;
+      throw err;
     }
   };
   return {

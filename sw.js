@@ -1,4 +1,4 @@
-const CACHE = "jobs-v2";
+const CACHE = "jobs-v4";
 const BASE = new URL("./", self.location);
 const FILES = [
   "",
@@ -25,8 +25,14 @@ const FILES = [
   "js/components.js",
   "js/images.js",
   "js/nav.js",
+  "js/sheet.js",
+  "js/layout.js",
+  "js/blueprint.js",
+  "js/contact.js",
+  "js/customer-ui.js",
   "js/views/home.js",
   "js/views/jobs.js",
+  "js/views/layout.js",
   "js/views/customers.js",
   "js/views/docs.js",
   "js/views/calendar.js",
@@ -36,7 +42,11 @@ const FILES = [
 ].map((path) => new URL(path, BASE).href);
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(FILES)).then(() => self.skipWaiting()));
+  event.waitUntil((async () => {
+    const cache = await caches.open(CACHE);
+    await Promise.all(FILES.map((url) => cache.add(url).catch(() => {})));
+    await self.skipWaiting();
+  })());
 });
 
 self.addEventListener("activate", (event) => {
@@ -47,13 +57,18 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
-  event.respondWith(
-    fetch(event.request)
-      .then((response) => {
+  event.respondWith((async () => {
+    try {
+      const response = await fetch(event.request);
+      if (response && response.ok && (response.type === "basic" || response.type === "cors")) {
         const copy = response.clone();
-        caches.open(CACHE).then((cache) => cache.put(event.request, copy));
-        return response;
-      })
-      .catch(() => caches.match(event.request).then((hit) => hit || caches.match(new URL("index.html", BASE).href)))
-  );
+        const cache = await caches.open(CACHE);
+        cache.put(event.request, copy);
+      }
+      return response;
+    } catch {
+      const hit = await caches.match(event.request);
+      return hit || caches.match(new URL("index.html", BASE).href);
+    }
+  })());
 });

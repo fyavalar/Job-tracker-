@@ -127,15 +127,67 @@ export function periodSummary(jobs, invoices, payments, period, today = todayISO
   };
 }
 
-export function invoicePaidCents(invoice, payments) {
-  return (payments || [])
+export function invoicePaidCents(invoice, payments, invoices) {
+  if (!invoice) return 0;
+  const attributed = (payments || [])
     .filter((p) => p.invoiceId === invoice.id)
     .reduce((sum, p) => sum + (Number(p.amountCents) || 0), 0);
+  if (!invoices || !invoice.jobId) return attributed;
+  const active = activeInvoices(invoices, invoice.jobId)
+    .slice()
+    .sort((a, b) => String(a.issueDate || "").localeCompare(String(b.issueDate || "")) || (Number(a.number) || 0) - (Number(b.number) || 0));
+  const unattr = (payments || [])
+    .filter((p) => p.jobId === invoice.jobId && !p.invoiceId)
+    .slice()
+    .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")) || String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
+  let pool = unattr.reduce((sum, p) => sum + (Number(p.amountCents) || 0), 0);
+  for (const inv of active) {
+    const already = (payments || [])
+      .filter((p) => p.invoiceId === inv.id)
+      .reduce((sum, p) => sum + (Number(p.amountCents) || 0), 0);
+    const need = Math.max(0, docTotals(inv).total - already);
+    const take = Math.min(need, pool);
+    if (inv.id === invoice.id) return already + take;
+    pool -= take;
+  }
+  return attributed;
 }
 
-export function invoiceBalanceCents(invoice, payments) {
+export function invoiceBalanceCents(invoice, payments, invoices) {
   if (!invoice || invoice.status === "void") return 0;
-  return docTotals(invoice).total - invoicePaidCents(invoice, payments);
+  return docTotals(invoice).total - invoicePaidCents(invoice, payments, invoices);
+}
+
+export function taxRateForContractInvoice(sourceEstimate, businessTaxRate) {
+  if (sourceEstimate) {
+    const rate = sourceEstimate.taxRate;
+    if (rate === 0 || rate) return Number(rate);
+    return Number(businessTaxRate) || 0;
+  }
+  return 0;
+}
+
+export function latestActiveInvoice(invoices, jobId) {
+  const list = activeInvoices(invoices, jobId)
+    .slice()
+    .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")) || (Number(b.number) || 0) - (Number(a.number) || 0));
+  return list[0] || null;
+}
+
+export function oldestUnpaidInvoiceId(invoices, payments, jobId, ignorePaymentId) {
+  const list = activeInvoices(invoices, jobId)
+    .slice()
+    .sort((a, b) => String(a.issueDate || "").localeCompare(String(b.issueDate || "")) || (Number(a.number) || 0) - (Number(b.number) || 0));
+  const pool = ignorePaymentId ? (payments || []).filter((p) => p.id !== ignorePaymentId) : payments;
+  for (const inv of list) {
+    if (invoiceBalanceCents(inv, pool, invoices) > 0) return inv.id;
+  }
+  return list[0]?.id || "";
+}
+
+export function balanceExcludingPayment(job, invoices, payments, paymentId) {
+  const list = paymentId ? (payments || []).filter((p) => p.id !== paymentId) : payments;
+  return balanceCents(job, invoices, list);
 }
 
 export function sqftFromLines(lines) {

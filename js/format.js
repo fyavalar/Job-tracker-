@@ -152,9 +152,9 @@ export function money(cents) {
 export function parseDollarsToCents(value) {
   const v = String(value ?? "").trim().replace(/[$,\s]/g, "");
   if (v === "") return 0;
-  const m = /^(\d+)(?:\.(\d{1,2}))?$/.exec(v);
-  if (!m) return null;
-  return Number(m[1]) * 100 + Number((m[2] || "").padEnd(2, "0"));
+  const m = /^(\d*)(?:\.(\d{0,2}))?$/.exec(v);
+  if (!m || (m[1] === "" && !m[2])) return null;
+  return Number(m[1] || 0) * 100 + Number((m[2] || "").padEnd(2, "0"));
 }
 
 export function numberToCents(value) {
@@ -180,7 +180,7 @@ export function centsToInput(cents) {
 export function parseQty(value) {
   const v = String(value ?? "").trim();
   if (v === "") return 0;
-  if (!/^\d+(\.\d{1,3})?$/.test(v)) return null;
+  if (!/^(\d+\.?\d{0,3}|\.\d{1,3})$/.test(v)) return null;
   return Math.round(Number(v) * 1000) / 1000;
 }
 
@@ -207,6 +207,15 @@ export function percentInput(n) {
 
 export function normName(value) {
   return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+// Accent- and case-insensitive text for search ("Şahin" matches "sahin", "İnci" matches "inci").
+export function foldText(value) {
+  return String(value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/ı/g, "i")
+    .toLowerCase();
 }
 
 export function digits(value) {
@@ -250,4 +259,51 @@ export function base64ToBytes(b64) {
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
+}
+
+
+export async function shareOrDownload(blob, filename, title) {
+  const type = blob.type || "application/octet-stream";
+  let file = null;
+  try {
+    file = new File([blob], filename, { type });
+  } catch {
+    file = null;
+  }
+  if (file && navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: title || filename });
+      return "shared";
+    } catch (error) {
+      if (error?.name === "AbortError") return "aborted";
+      // NotAllowedError etc: fall through to a plain download
+    }
+  }
+  downloadBlob(blob, filename);
+  return "downloaded";
+}
+
+export function safeFileName(text, fallback = "file") {
+  const s = foldText(text).replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+  return s || fallback;
+}
+
+const BACKUP_STAMP_KEY = "jobs-last-backup";
+
+export function rememberBackupTime(iso) {
+  const value = iso || new Date().toISOString();
+  try {
+    localStorage.setItem(BACKUP_STAMP_KEY, value);
+  } catch {
+    /* Stamp is a reminder only. */
+  }
+  return value;
+}
+
+export function lastBackupTime() {
+  try {
+    return localStorage.getItem(BACKUP_STAMP_KEY) || "";
+  } catch {
+    return "";
+  }
 }

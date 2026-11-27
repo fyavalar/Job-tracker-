@@ -4,7 +4,7 @@ function canvasBlob(canvas, type, quality) {
 
 async function loadFile(file) {
   try {
-    return await createImageBitmap(file);
+    return await createImageBitmap(file, { imageOrientation: "from-image" });
   } catch {
     const url = URL.createObjectURL(file);
     try {
@@ -34,7 +34,7 @@ async function drawToBlob(source, max, quality) {
   ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
   source.close?.();
   const blob = await canvasBlob(canvas, "image/jpeg", quality);
-  if (!blob) throw new Error("Couldn't read that photo. Try a JPEG.");
+  if (!blob) throw new Error("Couldn't read that photo. If it's an iPhone (HEIC) photo, try choosing it again or save a JPEG in Photos.");
   return blob;
 }
 
@@ -44,7 +44,7 @@ export async function compressImageFile(file) {
     const source = await loadFile(file);
     return await drawToBlob(source, 1600, 0.72);
   } catch {
-    throw new Error("Couldn't read that photo. Try a JPEG.");
+    throw new Error("Couldn't read that photo. If it's an iPhone (HEIC) photo, try choosing it again or save a JPEG in Photos.");
   }
 }
 
